@@ -3,28 +3,27 @@ import { Lobby as OriginalLobby } from './lobby.js';
 export class LobbyHttp extends OriginalLobby {
   constructor(state, env) {
     super(state, env);
-    this.pollQueues = new Map();    // 挂起的 GET 请求
-    this.messageQueues = new Map(); // ★ 未发出的消息暂存箱（防丢失）
+    this.conns = new Set(); // ★ 专门存长轮询的假 session
+    this.pollQueues = new Map();    
+    this.messageQueues = new Map(); 
   }
 
-  // 重写 fetch，统一处理 HTTP 轮询
   async fetch(req) {
     const url = new URL(req.url);
 
-    // 1. 处理前端发来的 POST 数据
+    // --- HTTP 长轮询逻辑 ---
     if (url.pathname === '/api/send') {
       const sid = url.searchParams.get('sid');
       const body = await req.text();
       
       const fakeWs = {
+        isFake: true,
         send: (msg) => {
-          // 如果前端正在挂起等待，直接发给他
           const q = this.pollQueues.get(sid);
           if (q && q.resolve) {
             q.resolve(new Response(msg, { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } }));
             this.pollQueues.delete(sid);
           } else {
-            // 如果前端还没发起 GET 拿货，把消息存进暂存箱
             if (!this.messageQueues.has(sid)) this.messageQueues.set(sid, []);
             this.messageQueues.get(sid).push(msg);
           }
@@ -35,8 +34,7 @@ export class LobbyHttp extends OriginalLobby {
       if (!sess) {
         sess = { id: sid, ws: fakeWs, room: null, profile: null, offline: false, timer: null, bucket: { tokens: 60, at: Date.now() } };
         this.conns.add(sess);
-        // 这里产生的 hello 消息，会被 push 进 messageQueues 暂存
-        fakeWs.send(JSON.stringify({ t: 'hello', id: sid, ranked: true, n: this.conns.size }));
+        this.sendMsg(sess, JSON.stringify({ t: 'hello', id: sid, ranked: true, n: this.dstate.getWebSockets().length + this.conns.size })); // 发送 hello
       } else {
         sess.ws = fakeWs; 
       }
@@ -47,30 +45,42 @@ export class LobbyHttp extends OriginalLobby {
       return new Response('ok', { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
     }
 
-    // 2. 处理前端发来的 GET 等待
     if (url.pathname === '/api/poll') {
       const sid = url.searchParams.get('sid');
-      
-      // 优先检查暂存箱里有没有消息
       const msgs = this.messageQueues.get(sid);
       if (msgs && msgs.length > 0) {
         return new Response(msgs.shift(), { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
       }
-
-      // 没消息，挂起等待
       return new Promise((resolve) => {
         const timer = setTimeout(() => {
           this.pollQueues.delete(sid);
           resolve(new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*' } }));
         }, 20000);
-
         this.pollQueues.set(sid, {
           resolve: (res) => { clearTimeout(timer); resolve(res); }
         });
       });
     }
 
-    // 3. 如果是 /ws 请求，交还给原本的 WebSocket 处理逻辑
+    // --- WebSocket 请求交还给父类 ---
     return super.fetch(req);
+  }
+
+  // ★ 核心魔法：重写发送逻辑。如果是假 WS 推队列，如果是真 WS 交父类。
+  sendSess(sess, obj) {
+    if (!sess) return;
+    if (sess.ws && sess.ws.isFake) {
+      sess.ws.send(JSON.stringify(obj));
+    } else {
+      super.sendSess(sess, obj);
+    }
+  }
+
+  broadcastOnline() {
+    const n = this.dstate.getWebSockets().length + this.conns.size;
+    this.conns.forEach(s => { try { this.sendSess(s, { t: 'online-count', n }); } catch (e) { } });
+    this.dstate.getWebSockets().forEach(ws => {
+      this.send(ws, { t: 'online-count', n });
+    });
   }
 }
