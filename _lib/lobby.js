@@ -6,6 +6,10 @@ const MSG_RATE = 20;
 const MSG_BURST = 60;
 const MSG_OVER_LIMIT = 300;
 
+// 排位赛配置
+const RANK_RANGE = 10; 
+const RANK_TURN_MS = 80000; 
+
 function normPass(p) { return String(p == null ? '' : p).trim().slice(0, 12); }
 
 function mkRoom(code, pass) {
@@ -13,7 +17,9 @@ function mkRoom(code, pass) {
   for (let i = 0; i < 4; i++) seats.push({ role: i < 2 ? 'fight' : 'watch', player: null });
   return {
     code, rule: 'bo1', hostId: null, status: 'waiting', seats, seq: 0, round: 0, game: null,
-    pass: normPass(pass), series: null, mode: 'friendly', ended: false
+    pass: normPass(pass), series: null, mode: 'friendly', ended: false,
+    // 排位房专属字段
+    rank: null, rankTimer: null, rankDeadline: 0, rankTag: null, rankWho: null
   };
 }
 
@@ -82,6 +88,7 @@ export class Lobby {
     this.conns = new Set();
     this.offline = new Map();
     this.nextPid = 1;
+    this.rankQueue = new Map(); // 排位匹配队列
   }
 
   async fetch(req) {
@@ -98,7 +105,8 @@ export class Lobby {
     ws.accept();
     const sess = { id: 'p' + (this.nextPid++), ws, room: null, profile: null, offline: false, timer: null };
     this.conns.add(sess);
-    this.send(ws, { t: 'hello', id: sess.id, ranked: false, n: this.conns.size });
+    // 开启排位支持
+    this.send(ws, { t: 'hello', id: sess.id, ranked: true, n: this.conns.size });
     this.bindConn(sess);
     this.broadcastOnline();
   }
@@ -146,6 +154,8 @@ export class Lobby {
     sess.closed = true;
     this.conns.delete(sess);
     this.broadcastOnline();
+    this.rankQueue.delete(sess.id); // 断线退出匹配
+    
     if (!sess.room) return;
     sess.offline = true;
     clearTimeout(sess.timer);
@@ -180,6 +190,9 @@ export class Lobby {
       case 'begin': this.beginBattle(sess, m); break;
       case 'act': this.doAct(sess, m.a); break;
       case 'prompt': this.doPrompt(sess, m.v); break;
+      // 排位入口
+      case 'ranked': this.doRankedQueue(sess, m); break;
+      case 'ranked-cancel': this.doRankedCancel(sess); break;
       default: break;
     }
   }
@@ -287,6 +300,7 @@ export class Lobby {
   doJoin(sess, code, pass) {
     const room = this.rooms.get(String(code || '').trim());
     if (!room) { this.sendMsg(sess, '没有找到房号 ' + code + ' 的房间'); return; }
+    if (room.mode === 'ranked') { this.sendMsg(sess, '该房间不可加入'); return; }
     if (room.pass && room.pass !== normPass(pass)) {
       this.sendMsg(sess, '密码不正确 —— 房间 ' + room.code + ' 已设密码，请向房主确认后重试');
       return;
@@ -303,6 +317,7 @@ export class Lobby {
   }
 
   leaveRoom(sess, silentQuit) {
+    this.rankQueue.delete(sess.id);
     if (!sess.room) return;
     const room = this.rooms.get(sess.room);
     sess.room = null;
@@ -314,6 +329,30 @@ export class Lobby {
     seat.player = null;
 
     if (room.game && wasFight) {
+      if (room.mode === 'ranked') {
+        const st = room.game.engine && room.game.engine.state;
+        const loserKey = room.game.A === sess.id ? 'A' : (room.game.B === sess.id ? 'B' : null);
+        if (loserKey && st && !st.winner) {
+          this.settleRanked(room, loserKey === 'A' ? 'B' : 'A', sess);
+        }
+        this.clearRankTimer(room);
+        room.game = null;
+        room.series = null;
+        room.ended = true;
+        room.status = 'waiting';
+        room.seats.forEach((s) => {
+          if (s.player) {
+            this.sendSess(s.player.sess, { t: 'battle-end', reason: '对手已离开，本局判负' });
+            s.player.ready = false;
+          }
+        });
+        room.seats.forEach((s) => {
+          if (s.player) { s.player.sess.room = null; s.player = null; }
+        });
+        this.rooms.delete(room.code);
+        return;
+      }
+      
       room.game = null;
       room.series = null;
       room.ended = false;
@@ -325,9 +364,7 @@ export class Lobby {
       });
     }
     if (silentQuit && other) this.sendMsg(other.sess, '有玩家断线离开了房间');
-
     if (!room.seats.some(s => s.player)) { this.rooms.delete(room.code); return; }
-
     if (room.hostId === sess.id) {
       const np = room.seats.find(s => s.player);
       room.hostId = np ? np.player.id : null;
@@ -432,8 +469,12 @@ export class Lobby {
     if (!room) return;
     if (!this.seatOfPlayer(room, sess.id)) { this.sendMsg(sess, '你不在这个房间里'); return; }
     const fs2 = room.seats.filter(s => s.role === 'fight' && s.player);
-    if (fs2.length !== 2) { this.sendMsg(sess, '需要两名对战玩家（房主 + 一名对手）'); return; }
-    if (!fs2.every(s => s.player.ready)) { this.sendMsg(sess, '双方都点「准备」后才能开始'); return; }
+    if (fs2.length !== 2) { this.sendMsg(sess, '需要两名对战玩家'); return; }
+    
+    // 排位赛无需准备，直接开打
+    if (room.mode !== 'ranked' && !fs2.every(s => s.player.ready)) { 
+      this.sendMsg(sess, '双方都点「准备」后才能开始'); return; 
+    }
     if (!fs2[0].player.deckIds.length || !fs2[1].player.deckIds.length) { this.sendMsg(sess, '有玩家的卡组是空的'); return; }
 
     const A = fs2[0].player, B = fs2[1].player;
@@ -450,7 +491,6 @@ export class Lobby {
     eng.state.players.B.isAI = false;
     eng.state.ach.off = true;
 
-    // 和原 server.js 的 createSandbox() 等价：每局一份独立 AI 实例，ensurePolicy() 把策略注册到 eng
     const ai = createAI(eng);
 
     room.round++;
@@ -485,9 +525,13 @@ export class Lobby {
   sendState(room, initial) {
     const g = room.game;
     if (!g) return;
+    this.armRankTimer(room); // 更新排位倒计时
+    
     const st = g.engine.state;
     if (st.winner && !room.ended) {
       room.ended = true;
+      if (room.mode === 'ranked') this.settleRanked(room, st.winner);
+      
       const s = room.series;
       if (s && !s.over) {
         s.wins[st.winner] = (s.wins[st.winner] || 0) + 1;
@@ -496,6 +540,7 @@ export class Lobby {
         this.broadcastRoom(room);
       }
     }
+    
     [['A', g.A], ['B', g.B]].forEach(([key, pid]) => {
       const sess = this.sessionOfPlayer(room, pid);
       if (!sess) return;
@@ -503,7 +548,8 @@ export class Lobby {
         t: initial ? 'battle' : 'state',
         s: this.snapshotFor(room, key),
         over: !!st.winner, winner: st.winner || null,
-        mode: room.mode, deadline: 0
+        mode: room.mode, 
+        deadline: room.mode === 'ranked' ? (room.rankDeadline || 0) : 0
       });
     });
     room.seats.forEach(s => {
@@ -557,7 +603,7 @@ export class Lobby {
     this.conns.delete(newSess);
     this.conns.add(old);
     this.bindConn(old);
-    this.send(old.ws, { t: 'hello', id: old.id, resumed: true, ranked: false, n: this.conns.size });
+    this.send(old.ws, { t: 'hello', id: old.id, resumed: true, ranked: true, n: this.conns.size });
     const room = old.room && this.rooms.get(old.room);
     if (room) {
       this.broadcastRoom(room);
@@ -565,5 +611,142 @@ export class Lobby {
       const other = room.seats.map(s => s.player).filter(p => p && p.id !== old.id && p.sess)[0];
       if (other) this.sendMsg(other.sess, '对手已重新连接，继续对局');
     }
+  }
+
+  /* ================= 排位赛专属逻辑 ================= */
+  checkRankedDeck(ids) {
+    if (!Array.isArray(ids)) return '排位赛需要先选择卡组';
+    if (ids.length !== 20) return '排位赛必须使用 20 张卡组（当前 ' + ids.length + ' 张）';
+    return null;
+  }
+
+  rankClamp(n) {
+    n = Math.round(Number(n));
+    if (!isFinite(n)) n = 1;
+    return Math.max(1, Math.min(100, n));
+  }
+
+  doRankedQueue(sess, m) {
+    const score = this.rankClamp(m && m.score);
+    const deckWhy = this.checkRankedDeck(sess.profile && sess.profile.deckIds);
+    if (deckWhy) { this.sendMsg(sess, deckWhy); return; }
+    
+    sess.rankScore = score;
+    if (sess.room) this.leaveRoom(sess, false);
+    this.rankQueue.delete(sess.id);
+    
+    let best = null;
+    this.rankQueue.forEach((e) => {
+      if (!e || !e.sess || e.sess.id === sess.id) return;
+      if (!e.sess.ws) return;
+      const d = Math.abs(e.score - score);
+      if (d > RANK_RANGE) return;
+      if (!best || d < best.d) best = { e: e, d: d };
+    });
+
+    if (best) {
+      this.rankQueue.delete(best.e.sess.id);
+      this.startRankedMatch(best.e.sess, sess);
+      return;
+    }
+    
+    this.rankQueue.set(sess.id, { sess: sess, score: score, since: Date.now() });
+    this.send(sess.ws, { t: 'ranked-wait', score: score, queue: this.rankQueue.size, range: RANK_RANGE });
+  }
+
+  doRankedCancel(sess) {
+    this.rankQueue.delete(sess.id);
+    this.send(sess.ws, { t: 'ranked-cancel' });
+  }
+
+  startRankedMatch(a, b) {
+    const sa = this.rankClamp(a.rankScore), sb = this.rankClamp(b.rankScore);
+    this.leaveRoom(a, false);
+    this.leaveRoom(b, false);
+    
+    const room = mkRoom(this.randCode(), '');
+    room.mode = 'ranked';
+    room.hostId = a.id;
+    room.status = 'playing';
+    room.rank = { scoreA: sa, scoreB: sb };
+    
+    a.profile = a.profile || this.normProfile({}, null);
+    b.profile = b.profile || this.normProfile({}, null);
+    
+    room.seats[0].player = Object.assign({}, a.profile, { id: a.id, sess: a, ready: true });
+    room.seats[1].player = Object.assign({}, b.profile, { id: b.id, sess: b, ready: true });
+    this.rooms.set(room.code, room);
+    
+    a.room = room.code; b.room = room.code;
+    room.series = newServerSeries({ rule: 'bo1', need: 1, total: 1 });
+    
+    this.broadcastRoom(room);
+    this.send(a.ws, { t: 'ranked-matched', room: this.pubRoomFor(room, a.id), score: sa });
+    this.send(b.ws, { t: 'ranked-matched', room: this.pubRoomFor(room, b.id), score: sb });
+    
+    this.beginBattle(a, { first: Math.random() < 0.5 ? 'A' : 'B', seed: (Date.now() >>> 0) });
+  }
+
+  settleRanked(room, winnerKey, loserSess) {
+    const g = room.game;
+    if (!g || !room.rank) return;
+    const winA = winnerKey === 'A';
+    const byForfeit = !!loserSess;
+    
+    const put = (pid, win, base, forfeit) => {
+      let sess = this.sessionOfPlayer(room, pid);
+      if (!sess && loserSess && loserSess.id === pid) sess = loserSess;
+      if (!sess) return;
+      const delta = win ? 1 : -1;
+      this.sendSess(sess, {
+        t: 'ranked-result', win, delta,
+        score: this.rankClamp(base + delta), mode: 'ranked', forfeit: !!forfeit
+      });
+    };
+    put(g.A, winA, room.rank.scoreA, byForfeit && !winA);
+    put(g.B, !winA, room.rank.scoreB, byForfeit && winA);
+    this.clearRankTimer(room);
+  }
+
+  clearRankTimer(room) {
+    if (!room) return;
+    if (room.rankTimer) { clearTimeout(room.rankTimer); room.rankTimer = null; }
+    room.rankDeadline = 0;
+  }
+
+  armRankTimer(room) {
+    if (!room || room.mode !== 'ranked') return;
+    const g = room.game;
+    if (!g) { this.clearRankTimer(room); return; }
+    const st = g.engine.state;
+    if (st.winner) { this.clearRankTimer(room); return; }
+    
+    const who = st.pending ? st.pending.actorKey : st.active;
+    const tag = (st.turnCount || 0) + ':' + st.active + ':' + (st.pending ? 'P' + st.pending.actorKey : 'R');
+    if (room.rankTag === tag && room.rankTimer) return;
+    
+    this.clearRankTimer(room);
+    room.rankTag = tag;
+    room.rankWho = who;
+    room.rankDeadline = Date.now() + RANK_TURN_MS;
+    
+    room.rankTimer = setTimeout(() => this.onRankTimeout(room), RANK_TURN_MS);
+  }
+
+  onRankTimeout(room) {
+    room.rankTimer = null;
+    const g = room.game;
+    if (!g) return;
+    let st = g.engine.state;
+    if (st.winner) { this.clearRankTimer(room); this.sendState(room, false); return; }
+    if (st.pending) {
+      try { g.engine.resolvePrompt(); } catch (e) { }
+      st = g.engine.state;
+    }
+    if (st.winner) { this.clearRankTimer(room); this.sendState(room, false); return; }
+    let r = null;
+    try { r = g.engine.tryAction({ type: 'END_TURN' }); } catch (e) { }
+    if (r && r.ok) { this.sendState(room, false); return; }
+    room.rankTimer = setTimeout(() => this.onRankTimeout(room), 5000);
   }
 }
