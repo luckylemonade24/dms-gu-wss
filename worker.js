@@ -9,7 +9,7 @@ export default {
       if (request.headers.get('Upgrade') !== 'websocket') {
         return new Response('expected websocket', { status: 426 });
       }
-      const id = env.LOBBY.idFromName('global');
+      const id = env.LOBBY.idFromName('global20261022');
       return env.LOBBY.get(id).fetch(request);
     }
     
