@@ -1,0 +1,19 @@
+{
+  "name": "dms-gu-wss",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-22",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LOBBY",
+        "class_name": "Lobby"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Lobby"]
+    }
+  ]
+}
