@@ -2,6 +2,8 @@
   "name": "dms-gu-wss",
   "main": "worker.js",
   "compatibility_date": "2026-10-22",
+  // ★ 新增下面这一行，开启 WebSocket 压缩支持
+  "compatibility_flags": ["web_socket_compression"],
   "durable_objects": {
     "bindings": [
       {
